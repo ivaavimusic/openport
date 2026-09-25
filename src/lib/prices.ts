@@ -1,11 +1,35 @@
-// Pricing via CoinGecko's public API — no key required, which keeps the
-// default setup free. Spot is one request for every asset held; history is one
-// request per distinct asset, cached for a day because a daily series does not
-// change intraday.
+// Pricing via public APIs — no key required, which keeps the default setup
+// free. CoinGecko is the primary source because it returns prices and logos in
+// one call. DefiLlama and CoinMarketCap are spot-price fallbacks for the times
+// a public API flakes out or rate-limits. History still uses CoinGecko because
+// it is non-critical and cached for a day.
 
 const CG = 'https://api.coingecko.com/api/v3';
+const LLAMA = 'https://coins.llama.fi';
+const CMC = 'https://pro-api.coinmarketcap.com/public-api';
 const SPOT_TTL_MS = 5 * 60 * 1000;
 const HISTORY_TTL_MS = 24 * 60 * 60 * 1000;
+
+const STABLE_USD_FALLBACKS: SpotPrices = {
+    dai: 1,
+    tether: 1,
+    'usd-coin': 1,
+};
+
+// CoinMarketCap supports slug lookup on its keyless endpoint. Keep this
+// explicit so symbol collisions do not price the wrong asset.
+const CMC_SLUG_BY_COINGECKO_ID: Record<string, string> = {
+    arbitrum: 'arbitrum',
+    bitcoin: 'bitcoin',
+    dai: 'multi-collateral-dai',
+    ethereum: 'ethereum',
+    hyperliquid: 'hyperliquid',
+    solana: 'solana',
+    tether: 'tether',
+    'usd-coin': 'usd-coin',
+    weth: 'weth',
+    'wrapped-bitcoin': 'wrapped-bitcoin',
+};
 
 export type SpotPrices = Record<string, number>;
 /** [unixMs, usd] ascending. */
@@ -47,11 +71,118 @@ export interface MarketData {
     images: Record<string, string>;
 }
 
+function hasPrice(data: MarketData, id: string): boolean {
+    return typeof data.prices[id] === 'number' && Number.isFinite(data.prices[id]);
+}
+
+function missingPriceIds(ids: string[], data: MarketData): string[] {
+    return ids.filter((id) => !hasPrice(data, id));
+}
+
+async function fetchDefiLlamaPrices(ids: string[]): Promise<SpotPrices> {
+    const unique = Array.from(new Set(ids.filter(Boolean))).sort();
+    if (unique.length === 0) return {};
+
+    try {
+        const coins = unique.map((id) => `coingecko:${id}`).join(',');
+        const res = await fetch(
+            `${LLAMA}/prices/current/${encodeURIComponent(coins)}`,
+        );
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = (await res.json()) as {
+            coins?: Record<string, { price?: number }>;
+        };
+
+        const out: SpotPrices = {};
+        for (const id of unique) {
+            const price = json.coins?.[`coingecko:${id}`]?.price;
+            if (typeof price === 'number' && Number.isFinite(price) && price > 0) {
+                out[id] = price;
+            }
+        }
+        return out;
+    } catch {
+        return {};
+    }
+}
+
+async function fetchCoinMarketCapPrices(ids: string[]): Promise<SpotPrices> {
+    const slugToId = new Map<string, string>();
+    for (const id of ids) {
+        const slug = CMC_SLUG_BY_COINGECKO_ID[id];
+        if (slug) slugToId.set(slug, id);
+    }
+    const slugs = Array.from(slugToId.keys()).sort();
+    if (slugs.length === 0) return {};
+
+    try {
+        const qs = new URLSearchParams({
+            slug: slugs.join(','),
+            convert: 'USD',
+        });
+        const res = await fetch(`${CMC}/v2/simple/price?${qs.toString()}`, {
+            headers: { Accept: 'application/json' },
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = (await res.json()) as {
+            data?: {
+                slug?: string;
+                quotes?: { symbol?: string; price?: number }[];
+            }[];
+        };
+
+        const out: SpotPrices = {};
+        for (const row of Array.isArray(json.data) ? json.data : []) {
+            const id = row.slug ? slugToId.get(row.slug) : undefined;
+            const price = row.quotes?.find((q) => q.symbol === 'USD')?.price;
+            if (
+                id &&
+                typeof price === 'number' &&
+                Number.isFinite(price) &&
+                price > 0
+            ) {
+                out[id] = price;
+            }
+        }
+        return out;
+    } catch {
+        return {};
+    }
+}
+
+async function fillMissingSpotPrices(
+    ids: string[],
+    data: MarketData,
+): Promise<MarketData> {
+    const prices = { ...data.prices };
+    const images = { ...data.images };
+    let missing = missingPriceIds(ids, { prices, images });
+
+    if (missing.length > 0) {
+        Object.assign(prices, await fetchDefiLlamaPrices(missing));
+        missing = missingPriceIds(ids, { prices, images });
+    }
+
+    if (missing.length > 0) {
+        Object.assign(prices, await fetchCoinMarketCapPrices(missing));
+        missing = missingPriceIds(ids, { prices, images });
+    }
+
+    for (const id of missing) {
+        const price = STABLE_USD_FALLBACKS[id];
+        if (price !== undefined) prices[id] = price;
+    }
+
+    return { prices, images };
+}
+
 /**
  * Spot price *and* logo for each CoinGecko id in a single request.
  *
  * /coins/markets costs exactly what /simple/price did but also carries the
- * icon, so token logos are free rather than a second round of lookups.
+ * icon, so token logos are free rather than a second round of lookups. Public
+ * price APIs can be intermittent, so missing prices are filled from fallback
+ * sources before the result is cached.
  */
 export async function fetchMarketData(ids: string[]): Promise<MarketData> {
     const unique = Array.from(new Set(ids.filter(Boolean))).sort();
@@ -59,26 +190,36 @@ export async function fetchMarketData(ids: string[]): Promise<MarketData> {
 
     const key = `openport-mkt:${unique.join(',')}`;
     const cached = readCache<MarketData>(key, SPOT_TTL_MS);
-    if (cached) return cached;
+    if (cached && missingPriceIds(unique, cached).length === 0) return cached;
 
-    const url = `${CG}/coins/markets?vs_currency=usd&ids=${unique.join(
-        ',',
-    )}&per_page=250&sparkline=false`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`Price lookup failed (HTTP ${res.status})`);
-    const json = (await res.json()) as {
-        id: string;
-        current_price?: number;
-        image?: string;
-    }[];
+    let out: MarketData = cached ?? { prices: {}, images: {} };
+    try {
+        const url = `${CG}/coins/markets?vs_currency=usd&ids=${unique.join(
+            ',',
+        )}&per_page=250&sparkline=false`;
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = (await res.json()) as {
+            id: string;
+            current_price?: number;
+            image?: string;
+        }[];
 
-    const out: MarketData = { prices: {}, images: {} };
-    for (const row of Array.isArray(json) ? json : []) {
-        if (typeof row.current_price === 'number') {
-            out.prices[row.id] = row.current_price;
+        out = { prices: { ...out.prices }, images: { ...out.images } };
+        for (const row of Array.isArray(json) ? json : []) {
+            if (
+                typeof row.current_price === 'number' &&
+                Number.isFinite(row.current_price)
+            ) {
+                out.prices[row.id] = row.current_price;
+            }
+            if (row.image) out.images[row.id] = row.image;
         }
-        if (row.image) out.images[row.id] = row.image;
+    } catch {
+        // Fallbacks below keep balances useful during public API outages.
     }
+
+    out = await fillMissingSpotPrices(unique, out);
     writeCache(key, out);
     return out;
 }
