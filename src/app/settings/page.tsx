@@ -25,6 +25,7 @@ import {
     addWallets,
     usedCategories,
     WALLET_CATEGORIES,
+    PRICE_REFRESH_OPTIONS,
     DraftWallet,
     Settings,
 } from '@/lib/settings';
@@ -334,6 +335,42 @@ export default function SettingsPage() {
                             ))}
                         </div>
                     )}
+                </Card>
+
+                {/* Price refresh */}
+                <Card className="p-6 border-0 bg-card text-card-foreground">
+                    <h2 className="font-bold mb-1">Price refresh</h2>
+                    <p className="text-xs text-muted-foreground mb-4">
+                        Cached balances are kept locally. Market prices refresh in the
+                        background when they are older than this.
+                    </p>
+                    <Select
+                        value={String(settings.priceRefreshMs)}
+                        onValueChange={(value) => {
+                            const option = PRICE_REFRESH_OPTIONS.find(
+                                (x) => x.value === Number(value),
+                            );
+                            if (!option) return;
+                            commit({
+                                ...settings,
+                                priceRefreshMs: option.value,
+                            });
+                        }}
+                    >
+                        <SelectTrigger className="w-full sm:w-64">
+                            <SelectValue placeholder="Refresh cadence" />
+                        </SelectTrigger>
+                        <SelectContent>
+                            {PRICE_REFRESH_OPTIONS.map((option) => (
+                                <SelectItem
+                                    key={option.value}
+                                    value={String(option.value)}
+                                >
+                                    {option.label}
+                                </SelectItem>
+                            ))}
+                        </SelectContent>
+                    </Select>
                 </Card>
 
                 {/* Alchemy key */}

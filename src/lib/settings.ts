@@ -8,6 +8,18 @@ const STORAGE_KEY = 'openport';
 /** Previous name. Read once so an existing install keeps its wallets and key. */
 const LEGACY_STORAGE_KEY = 'bunny-portfolio';
 export const SETTINGS_VERSION = 1;
+export const DEFAULT_PRICE_REFRESH_MS = 60 * 60 * 1000;
+
+export const PRICE_REFRESH_OPTIONS = [
+    { label: 'Every 5 minutes', value: 5 * 60 * 1000 },
+    { label: 'Every 15 minutes', value: 15 * 60 * 1000 },
+    { label: 'Hourly', value: DEFAULT_PRICE_REFRESH_MS },
+    { label: 'Every 6 hours', value: 6 * 60 * 60 * 1000 },
+    { label: 'Every 12 hours', value: 12 * 60 * 60 * 1000 },
+    { label: 'Daily', value: 24 * 60 * 60 * 1000 },
+] as const;
+
+export type PriceRefreshMs = (typeof PRICE_REFRESH_OPTIONS)[number]['value'];
 
 export interface Wallet {
     id: string;
@@ -66,6 +78,8 @@ export interface Settings {
     version: number;
     alchemyKey: string;
     wallets: Wallet[];
+    /** How old cached prices can get before the app refreshes them. */
+    priceRefreshMs: PriceRefreshMs;
     /** chain id -> ordered custom endpoints, tried after the public ones. */
     rpcs: Record<string, string[]>;
     snapshots: Snapshot[];
@@ -76,6 +90,7 @@ export const emptySettings = (): Settings => ({
     version: SETTINGS_VERSION,
     alchemyKey: '',
     wallets: [],
+    priceRefreshMs: DEFAULT_PRICE_REFRESH_MS,
     rpcs: {},
     snapshots: [],
 });
@@ -139,6 +154,11 @@ function migrate(raw: unknown): Settings {
         version: SETTINGS_VERSION,
         alchemyKey: typeof o.alchemyKey === 'string' ? o.alchemyKey : '',
         wallets,
+        priceRefreshMs: PRICE_REFRESH_OPTIONS.some(
+            (x) => x.value === o.priceRefreshMs,
+        )
+            ? (o.priceRefreshMs as PriceRefreshMs)
+            : DEFAULT_PRICE_REFRESH_MS,
         rpcs,
         snapshots,
         cache,

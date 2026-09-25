@@ -16,6 +16,7 @@ import {
     appendSnapshot,
     usedCategories,
     Settings,
+    DEFAULT_PRICE_REFRESH_MS,
 } from '@/lib/settings';
 import { toDecimal } from '@/lib/evm';
 import {
@@ -25,6 +26,7 @@ import {
     toCache,
     fromCache,
     mergeWalletResult,
+    repricePortfolio,
     PortfolioResult,
     ChartPoint,
 } from '@/lib/portfolio';
@@ -76,6 +78,7 @@ export default function PortfolioPage() {
     /** Share of the charted total that has no price history, 0-1. */
     const [flatShare, setFlatShare] = useState(0);
     const [loading, setLoading] = useState(false);
+    const [priceRefreshing, setPriceRefreshing] = useState(false);
     const [chartLoading, setChartLoading] = useState(false);
     const [selected, setSelected] = useState<string[]>([]);
     /** Empty = every wallet combined. */
@@ -236,8 +239,29 @@ export default function PortfolioPage() {
         [],
     );
 
+    const refreshPrices = useCallback(async (current: PortfolioResult, s: Settings) => {
+        if (current.balances.length === 0) return;
+        setPriceRefreshing(true);
+        try {
+            const repriced = await repricePortfolio(current, s.wallets);
+            setData(repriced);
+            setStale(false);
+
+            const next: Settings = { ...s, cache: toCache(repriced) };
+            saveSettings(next);
+            setSettings(next);
+        } catch (e) {
+            toast.error('Could not refresh prices', {
+                description: e instanceof Error ? e.message : 'Unknown error',
+            });
+        } finally {
+            setPriceRefreshing(false);
+        }
+    }, []);
+
     // Show the cached portfolio instantly and make no network calls; only fetch
-    // when there is nothing cached. Refreshing is the user's decision.
+    // balances when there is nothing cached. Prices refresh themselves on the
+    // user's configured cadence.
     useEffect(() => {
         if (!settings || data || settings.wallets.length === 0) return;
         if (settings.cache) {
@@ -251,6 +275,30 @@ export default function PortfolioPage() {
         void refresh(settings);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [settings?.wallets.length, settings?.cache?.fetchedAt]);
+
+    useEffect(() => {
+        if (!settings || !data || loading || priceRefreshing) return;
+        const every = settings.priceRefreshMs ?? DEFAULT_PRICE_REFRESH_MS;
+        const wait = data.fetchedAt + every - Date.now();
+
+        if (wait <= 0) {
+            void refreshPrices(data, settings);
+            return;
+        }
+
+        const timeout = window.setTimeout(
+            () => void refreshPrices(data, settings),
+            wait,
+        );
+        return () => window.clearTimeout(timeout);
+    }, [
+        data,
+        loading,
+        priceRefreshing,
+        refreshPrices,
+        settings,
+        settings?.priceRefreshMs,
+    ]);
 
     // A badge can stand for several sources (Hyperliquid is two), so toggling
     // it moves every id behind it together.
@@ -415,6 +463,9 @@ export default function PortfolioPage() {
                                         <>
                                             {stale ? 'cached · ' : ''}
                                             updated {ago(data.fetchedAt)} ·{' '}
+                                            {priceRefreshing
+                                                ? 'refreshing prices · '
+                                                : ''}
                                             {data.mode === 'alchemy'
                                                 ? 'Alchemy key — full token discovery'
                                                 : 'public RPC — major tokens only'}

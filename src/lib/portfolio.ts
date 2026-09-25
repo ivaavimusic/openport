@@ -458,6 +458,40 @@ export function mergeWalletResult(
     };
 }
 
+/**
+ * Refresh market prices against already-cached balances.
+ *
+ * This is intentionally cheaper than `loadPortfolio`: balances, NFT data and
+ * chain status stay untouched while only spot prices/logos are updated.
+ */
+export async function repricePortfolio(
+    current: PortfolioResult,
+    wallets: Wallet[],
+): Promise<PortfolioResult> {
+    const ids = current.balances
+        .map((b) => b.coingeckoId)
+        .filter((x): x is string => !!x);
+    const market = await fetchMarketData(ids);
+    const spot = { ...current.spot, ...market.prices };
+    const images = { ...current.images, ...market.images };
+    const { assets, wallets: walletRows, totalUsd } = aggregate(
+        current.balances,
+        spot,
+        wallets,
+        images,
+    );
+
+    return {
+        ...current,
+        assets,
+        wallets: walletRows,
+        totalUsd,
+        spot,
+        images,
+        fetchedAt: Date.now(),
+    };
+}
+
 /* ------------------------------------------------------------------ *
  * Caching. Reopening the app should cost nothing; refresh is explicit.
  * ------------------------------------------------------------------ */
